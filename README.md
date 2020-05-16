@@ -26,10 +26,10 @@ For new features, improvements and bugs fill an issue in GitHub or make a pull r
 
 ### Features
 
-* System: GPT, UEFI, BIOS
+* System: UEFI, BIOS
 * Storage: SATA, NVMe and MMC
 * Encryption: root partition encrypted and no encrypted
-* Partition: no LVM, LVM, LVM on LUKS
+* Partition: no LVM, LVM, LVM on LUKS, GPT on UEFI, MBR on BIOS
 * File system: ext4, btrfs (with subvols), xfs
 * Optional file swap (not supported in btrfs)
 * Storage: SATA, NVMe and MMC
@@ -46,6 +46,7 @@ For new features, improvements and bugs fill an issue in GitHub or make a pull r
 * Kernel compression and custom parameters
 * Users creation and add to sudoers
 * Common and custom packages installation
+* systemd units enable or disable
 * AUR utility installation (aurman, yay)
 * Script for download installation and recovery scripts and configuration files
 * Retry packages download on connection/mirror error

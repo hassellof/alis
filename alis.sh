@@ -42,9 +42,10 @@ set -e
 # global variables (no configuration, don't edit)
 ASCIINEMA=""
 BIOS_TYPE=""
-PARTITION_BIOS=""
 PARTITION_BOOT=""
 PARTITION_ROOT=""
+PARTITION_BOOT_NUMBER=""
+PARTITION_ROOT_NUMBER=""
 DEVICE_ROOT=""
 DEVICE_LVM=""
 LUKS_DEVICE_NAME="cryptroot"
@@ -65,10 +66,9 @@ CPU_VENDOR=""
 VIRTUALBOX=""
 CMDLINE_LINUX_ROOT=""
 CMDLINE_LINUX=""
-ADDITIONAL_USER_NAMES_ARRAY=()
-ADDITIONAL_USER_PASSWORDS_ARRAY=()
 
 CONF_FILE="alis.conf"
+GLOBALS_FILE="alis-globals.conf"
 LOG_FILE="alis.log"
 ASCIINEMA_FILE="alis.asciinema"
 
@@ -79,20 +79,18 @@ NC='\033[0m'
 
 function configuration_install() {
     source alis.conf
-    ADDITIONAL_USER_NAMES_ARRAY=($ADDITIONAL_USER_NAMES)
-    ADDITIONAL_USER_PASSWORDS_ARRAY=($ADDITIONAL_USER_PASSWORDS)
 }
 
 function sanitize_variables() {
     DEVICE=$(sanitize_variable "$DEVICE")
     PARTITION_MODE=$(sanitize_variable "$PARTITION_MODE")
-    PARTITION_BIOS=$(sanitize_variable "$PARTITION_BIOS")
-    PARTITION_BOOT=$(sanitize_variable "$PARTITION_BOOT")
-    PARTITION_ROOT=$(sanitize_variable "$PARTITION_ROOT")
+    PARTITION_CUSTOMMANUAL_BOOT=$(sanitize_variable "$PARTITION_CUSTOMMANUAL_BOOT")
+    PARTITION_CUSTOMMANUAL_ROOT=$(sanitize_variable "$PARTITION_CUSTOMMANUAL_ROOT")
     FILE_SYSTEM_TYPE=$(sanitize_variable "$FILE_SYSTEM_TYPE")
     SWAP_SIZE=$(sanitize_variable "$SWAP_SIZE")
     KERNELS=$(sanitize_variable "$KERNELS")
     KERNELS_COMPRESSION=$(sanitize_variable "$KERNELS_COMPRESSION")
+    SYSTEMD_HOMED_STORAGE=$(sanitize_variable "$SYSTEMD_HOMED_STORAGE")
     BOOTLOADER=$(sanitize_variable "$BOOTLOADER")
     DESKTOP_ENVIRONMENT=$(sanitize_variable "$DESKTOP_ENVIRONMENT")
     DISPLAY_DRIVER=$(sanitize_variable "$DISPLAY_DRIVER")
@@ -115,18 +113,22 @@ function check_variables() {
     check_variables_value "KEYS" "$KEYS"
     check_variables_boolean "LOG" "$LOG"
     check_variables_value "DEVICE" "$DEVICE"
+    check_variables_boolean "DEVICE_TRIM" "$DEVICE_TRIM"
     check_variables_boolean "LVM" "$LVM"
-    check_variables_equals "PARTITION_ROOT_ENCRYPTION_PASSWORD" "PARTITION_ROOT_ENCRYPTION_PASSWORD_RETYPE" "$PARTITION_ROOT_ENCRYPTION_PASSWORD" "$PARTITION_ROOT_ENCRYPTION_PASSWORD_RETYPE"
+    check_variables_list "FILE_SYSTEM_TYPE" "$FILE_SYSTEM_TYPE" "ext4 btrfs xfs"
+    check_variables_equals "LUKS_PASSWORD" "LUKS_PASSWORD_RETYPE" "$LUKS_PASSWORD" "$LUKS_PASSWORD_RETYPE"
     check_variables_list "PARTITION_MODE" "$PARTITION_MODE" "auto custom manual" "true"
-    check_variables_value "PARTITION_CUSTOM_PARTED_UEFI" "$PARTITION_CUSTOM_PARTED_UEFI"
-    check_variables_value "PARTITION_CUSTOM_PARTED_BIOS" "$PARTITION_CUSTOM_PARTED_BIOS"
-    check_variables_value "PARTITION_BIOS" "$PARTITION_BIOS"
-    check_variables_value "PARTITION_BOOT" "$PARTITION_BOOT"
-    check_variables_value "PARTITION_ROOT" "$PARTITION_ROOT"
+    if [ "$PARTITION_MODE" == "custom" ]; then
+        check_variables_value "PARTITION_CUSTOM_PARTED_UEFI" "$PARTITION_CUSTOM_PARTED_UEFI"
+        check_variables_value "PARTITION_CUSTOM_PARTED_BIOS" "$PARTITION_CUSTOM_PARTED_BIOS"
+    fi
+    if [ "$PARTITION_MODE" == "custom" -o "$PARTITION_MODE" == "manual" ]; then
+        check_variables_value "PARTITION_CUSTOMMANUAL_BOOT" "$PARTITION_CUSTOMMANUAL_BOOT"
+        check_variables_value "PARTITION_CUSTOMMANUAL_ROOT" "$PARTITION_CUSTOMMANUAL_ROOT"
+    fi
     if [ "$LVM" == "true" ]; then
         check_variables_list "PARTITION_MODE" "$PARTITION_MODE" "auto" "true"
     fi
-    check_variables_list "FILE_SYSTEM_TYPE" "$FILE_SYSTEM_TYPE" "ext4 btrfs xfs"
     check_variables_value "PING_HOSTNAME" "$PING_HOSTNAME"
     check_variables_value "PACMAN_MIRROR" "$PACMAN_MIRROR"
     check_variables_list "KERNELS" "$KERNELS" "linux-lts linux-lts-headers linux-hardened linux-hardened-headers linux-zen linux-zen-headers" "false"
@@ -141,6 +143,18 @@ function check_variables() {
     check_variables_value "USER_PASSWORD" "$USER_PASSWORD"
     check_variables_equals "ROOT_PASSWORD" "ROOT_PASSWORD_RETYPE" "$ROOT_PASSWORD" "$ROOT_PASSWORD_RETYPE"
     check_variables_equals "USER_PASSWORD" "USER_PASSWORD_RETYPE" "$USER_PASSWORD" "$USER_PASSWORD_RETYPE"
+    check_variables_boolean "SYSTEMD_HOMED" "$SYSTEMD_HOMED"
+    if [ "$SYSTEMD_HOMED" == "true" ]; then
+        check_variables_list "SYSTEMD_HOMED_STORAGE" "$SYSTEMD_HOMED_STORAGE" "directory fscrypt luks cifs subvolume" "true"
+
+        if [ "$SYSTEMD_HOMED_STORAGE" == "fscrypt" ]; then
+            check_variables_list "FILE_SYSTEM_TYPE" "$FILE_SYSTEM_TYPE" "ext4 f2fs" "true"
+        fi
+        if [ "$SYSTEMD_HOMED_STORAGE" == "cifs" ]; then
+            check_variables_value "SYSTEMD_HOMED_CIFS_DOMAIN" "$SYSTEMD_HOMED_CIFS_DOMAIN"
+            check_variables_value "SYSTEMD_HOMED_CIFS_SERVICE" "$SYSTEMD_HOMED_CIFS_SERVICE"
+        fi
+    fi
     check_variables_value "HOOKS" "$HOOKS"
     check_variables_list "BOOTLOADER" "$BOOTLOADER" "grub refind systemd"
     check_variables_list "AUR" "$AUR" "aurman yay" "false"
@@ -343,69 +357,72 @@ function partition() {
     print_step "partition()"
 
     # setup
-    PARTITION_PARTED_UEFI="mklabel gpt mkpart primary fat32 1MiB 512MiB mkpart primary $FILE_SYSTEM_TYPE 512MiB 100% set 1 boot on"
-    PARTITION_PARTED_BIOS="mklabel gpt mkpart primary fat32 1MiB 128MiB mkpart primary $FILE_SYSTEM_TYPE 128MiB 512MiB mkpart primary $FILE_SYSTEM_TYPE 512MiB 100% set 1 boot on"
-
     if [ "$PARTITION_MODE" == "auto" ]; then
+        PARTITION_PARTED_UEFI="mklabel gpt mkpart primary fat32 1MiB 512MiB mkpart primary $FILE_SYSTEM_TYPE 512MiB 100% set 1 boot on"
+        PARTITION_PARTED_BIOS="mklabel msdos mkpart primary ext4 4MiB 512MiB mkpart primary $FILE_SYSTEM_TYPE 512MiB 100% set 1 boot on"
+
         if [ "$BIOS_TYPE" == "uefi" ]; then
             if [ "$DEVICE_SATA" == "true" ]; then
                 PARTITION_BOOT="${DEVICE}1"
                 PARTITION_ROOT="${DEVICE}2"
-                #PARTITION_BOOT_NUMBER=1
                 DEVICE_ROOT="${DEVICE}2"
             fi
 
             if [ "$DEVICE_NVME" == "true" ]; then
                 PARTITION_BOOT="${DEVICE}p1"
                 PARTITION_ROOT="${DEVICE}p2"
-                #PARTITION_BOOT_NUMBER=1
                 DEVICE_ROOT="${DEVICE}p2"
             fi
 
             if [ "$DEVICE_MMC" == "true" ]; then
                 PARTITION_BOOT="${DEVICE}p1"
                 PARTITION_ROOT="${DEVICE}p2"
-                #PARTITION_BOOT_NUMBER=1
                 DEVICE_ROOT="${DEVICE}p2"
             fi
         fi
 
         if [ "$BIOS_TYPE" == "bios" ]; then
             if [ "$DEVICE_SATA" == "true" ]; then
-                PARTITION_BIOS="${DEVICE}1"
-                PARTITION_BOOT="${DEVICE}2"
-                PARTITION_ROOT="${DEVICE}3"
-                #PARTITION_BOOT_NUMBER=2
-                DEVICE_ROOT="${DEVICE}3"
+                PARTITION_BOOT="${DEVICE}1"
+                PARTITION_ROOT="${DEVICE}2"
+                DEVICE_ROOT="${DEVICE}2"
             fi
 
             if [ "$DEVICE_NVME" == "true" ]; then
-                PARTITION_BIOS="${DEVICE}p1"
-                PARTITION_BOOT="${DEVICE}p2"
-                PARTITION_ROOT="${DEVICE}p3"
-                #PARTITION_BOOT_NUMBER=2
-                DEVICE_ROOT="${DEVICE}p3"
+                PARTITION_BOOT="${DEVICE}p1"
+                PARTITION_ROOT="${DEVICE}p2"
+                DEVICE_ROOT="${DEVICE}p2"
             fi
 
             if [ "$DEVICE_MMC" == "true" ]; then
-                PARTITION_BIOS="${DEVICE}p1"
-                PARTITION_BOOT="${DEVICE}p2"
-                PARTITION_ROOT="${DEVICE}p3"
-                #PARTITION_BOOT_NUMBER=2
-                DEVICE_ROOT="${DEVICE}p3"
+                PARTITION_BOOT="${DEVICE}p1"
+                PARTITION_ROOT="${DEVICE}p2"
+                DEVICE_ROOT="${DEVICE}p2"
             fi
         fi
     elif [ "$PARTITION_MODE" == "custom" ]; then
-        PARTITION_PARTED_UEFI=$PARTITION_CUSTOM_PARTED_UEFI
-        PARTITION_PARTED_BIOS=$PARTITION_CUSTOM_PARTED_BIOS
-        DEVICE_ROOT="${PARTITION_ROOT}"
-    elif [ "$PARTITION_MODE" == "manual" ]; then
+        PARTITION_PARTED_UEFI="$PARTITION_CUSTOM_PARTED_UEFI"
+        PARTITION_PARTED_BIOS="$PARTITION_CUSTOM_PARTED_BIOS"
+    fi
+
+    if [ "$PARTITION_MODE" == "custom" -o "$PARTITION_MODE" == "manual" ]; then
+        PARTITION_BOOT="$PARTITION_CUSTOMMANUAL_BOOT"
+        PARTITION_ROOT="$PARTITION_CUSTOMMANUAL_ROOT"
         DEVICE_ROOT="${PARTITION_ROOT}"
     fi
 
+    PARTITION_BOOT_NUMBER="$PARTITION_BOOT"
+    PARTITION_ROOT_NUMBER="$PARTITION_ROOT"
+    PARTITION_BOOT_NUMBER="${PARTITION_BOOT_NUMBER//\/dev\/sda/}"
+    PARTITION_BOOT_NUMBER="${PARTITION_BOOT_NUMBER//\/dev\/nvme0n1p/}"
+    PARTITION_BOOT_NUMBER="${PARTITION_BOOT_NUMBER//\/dev\/mmcblk0p/}"
+    PARTITION_ROOT_NUMBER="${PARTITION_ROOT_NUMBER//\/dev\/sda/}"
+    PARTITION_ROOT_NUMBER="${PARTITION_ROOT_NUMBER//\/dev\/nvme0n1p/}"
+    PARTITION_ROOT_NUMBER="${PARTITION_ROOT_NUMBER//\/dev\/mmcblk0p/}"
+
     # partition
     if [ "$FILE_SYSTEM_TYPE" == "f2fs" ]; then
-        pacman -S f2fs-tools
+        pacman -Syu --noconfirm f2fs-tools
     fi
 
     if [ "$PARTITION_MODE" == "auto" ]; then
@@ -417,35 +434,28 @@ function partition() {
         if [ "$BIOS_TYPE" == "uefi" ]; then
             parted -s $DEVICE $PARTITION_PARTED_UEFI
 
-            if [ "$PARTITION_MODE" == "auto" ]; then
-                sgdisk -t=1:ef00 $DEVICE
-                if [ "$LVM" == "true" ]; then
-                    sgdisk -t=2:8e00 $DEVICE
-                fi
+            sgdisk -t=$PARTITION_BOOT_NUMBER:ef00 $DEVICE
+            if [ -n "$LUKS_PASSWORD" ]; then
+                sgdisk -t=$PARTITION_ROOT_NUMBER:8309 $DEVICE
+            elif [ "$LVM" == "true" ]; then
+                sgdisk -t=$PARTITION_ROOT_NUMBER:8e00 $DEVICE
             fi
         fi
 
         if [ "$BIOS_TYPE" == "bios" ]; then
             parted -s $DEVICE $PARTITION_PARTED_BIOS
-
-            if [ "$PARTITION_MODE" == "auto" ]; then
-                sgdisk -t=1:ef02 $DEVICE
-                if [ "$LVM" == "true" ]; then
-                    sgdisk -t=3:8e00 $DEVICE
-                fi
-            fi
         fi
     fi
 
     # luks and lvm
-    if [ -n "$PARTITION_ROOT_ENCRYPTION_PASSWORD" ]; then
-        echo -n "$PARTITION_ROOT_ENCRYPTION_PASSWORD" | cryptsetup --key-size=512 --key-file=- luksFormat --type luks2 $PARTITION_ROOT
-        echo -n "$PARTITION_ROOT_ENCRYPTION_PASSWORD" | cryptsetup --key-file=- open $PARTITION_ROOT $LUKS_DEVICE_NAME
+    if [ -n "$LUKS_PASSWORD" ]; then
+        echo -n "$LUKS_PASSWORD" | cryptsetup --key-size=512 --key-file=- luksFormat --type luks2 $PARTITION_ROOT
+        echo -n "$LUKS_PASSWORD" | cryptsetup --key-file=- open $PARTITION_ROOT $LUKS_DEVICE_NAME
         sleep 5
     fi
 
     if [ "$LVM" == "true" ]; then
-        if [ -n "$PARTITION_ROOT_ENCRYPTION_PASSWORD" ]; then
+        if [ -n "$LUKS_PASSWORD" ]; then
             DEVICE_LVM="/dev/mapper/$LUKS_DEVICE_NAME"
         else
             DEVICE_LVM="$DEVICE_ROOT"
@@ -456,7 +466,7 @@ function partition() {
         lvcreate -l 100%FREE -n $LVM_VOLUME_LOGICAL $LVM_VOLUME_GROUP
     fi
 
-    if [ -n "$PARTITION_ROOT_ENCRYPTION_PASSWORD" ]; then
+    if [ -n "$LUKS_PASSWORD" ]; then
         DEVICE_ROOT="/dev/mapper/$LUKS_DEVICE_NAME"
     fi
     if [ "$LVM" == "true" ]; then
@@ -472,10 +482,8 @@ function partition() {
     fi
 
     if [ "$BIOS_TYPE" == "bios" ]; then
-        wipefs -a $PARTITION_BIOS
         wipefs -a $PARTITION_BOOT
         wipefs -a $DEVICE_ROOT
-        mkfs.fat -n BIOS -F32 $PARTITION_BIOS
         mkfs."$FILE_SYSTEM_TYPE" -L boot $PARTITION_BOOT
         mkfs."$FILE_SYSTEM_TYPE" -L root $DEVICE_ROOT
     fi
@@ -483,7 +491,11 @@ function partition() {
     PARTITION_OPTIONS="defaults"
 
     if [ "$DEVICE_TRIM" == "true" ]; then
-        PARTITION_OPTIONS="$PARTITION_OPTIONS,noatime"
+        if [ "$FILE_SYSTEM_TYPE" == "f2fs" ]; then
+            PARTITION_OPTIONS="$PARTITION_OPTIONS,noatime,nodiscard"
+        else
+            PARTITION_OPTIONS="$PARTITION_OPTIONS,noatime"
+        fi
     fi
 
     # mount
@@ -555,7 +567,11 @@ function configuration() {
     fi
 
     if [ "$DEVICE_TRIM" == "true" ]; then
-        sed -i 's/relatime/noatime/' /mnt/etc/fstab
+        if [ "$FILE_SYSTEM_TYPE" == "f2fs" ]; then
+            sed -i 's/relatime/noatime,nodiscard/' /mnt/etc/fstab
+        else
+            sed -i 's/relatime/noatime/' /mnt/etc/fstab
+        fi
         arch-chroot /mnt systemctl enable fstrim.timer
     fi
 
@@ -634,7 +650,7 @@ function mkinitcpio_configuration() {
         if [ "$LVM" == "true" ]; then
             HOOKS=$(echo $HOOKS | sed 's/!sd-lvm2/sd-lvm2/')
         fi
-        if [ -n "$PARTITION_ROOT_ENCRYPTION_PASSWORD" ]; then
+        if [ -n "$LUKS_PASSWORD" ]; then
             HOOKS=$(echo $HOOKS | sed 's/!sd-encrypt/sd-encrypt/')
         fi
     else
@@ -645,7 +661,7 @@ function mkinitcpio_configuration() {
         if [ "$LVM" == "true" ]; then
             HOOKS=$(echo $HOOKS | sed 's/!lvm2/lvm2/')
         fi
-        if [ -n "$PARTITION_ROOT_ENCRYPTION_PASSWORD" ]; then
+        if [ -n "$LUKS_PASSWORD" ]; then
             HOOKS=$(echo $HOOKS | sed 's/!encrypt/encrypt/')
         fi
     fi
@@ -689,6 +705,116 @@ function virtualbox() {
     fi
 }
 
+function users() {
+    print_step "users()"
+
+    create_user "$USER_NAME" "$USER_PASSWORD"
+
+    for U in ${ADDITIONAL_USERS[@]}; do
+        IFS='=' S=(${U})
+        USER=${S[0]}
+        PASSWORD=${S[1]}
+        create_user "${USER}" "${PASSWORD}"
+    done
+
+	arch-chroot /mnt sed -i 's/# %wheel ALL=(ALL) ALL/%wheel ALL=(ALL) ALL/' /etc/sudoers
+
+    pacman_install "xdg-user-dirs"
+
+    if [ "$SYSTEMD_HOMED" == "true" ]; then
+        cat <<EOT > "/mnt/etc/pam.d/nss-auth"
+#%PAM-1.0
+
+auth     sufficient pam_unix.so try_first_pass nullok
+auth     sufficient pam_systemd_home.so
+auth     required   pam_deny.so
+
+account  sufficient pam_unix.so
+account  sufficient pam_systemd_home.so
+account  required   pam_deny.so
+
+password sufficient pam_unix.so try_first_pass nullok sha512 shadow
+password sufficient pam_systemd_home.so
+password required   pam_deny.so
+EOT
+
+        cat <<EOT > "/mnt/etc/pam.d/system-auth"
+#%PAM-1.0
+
+auth      substack   nss-auth
+auth      optional   pam_permit.so
+auth      required   pam_env.so
+
+account   substack   nss-auth
+account   optional   pam_permit.so
+account   required   pam_time.so
+
+password  substack   nss-auth
+password  optional   pam_permit.so
+
+session   required  pam_limits.so
+session   optional  pam_systemd_home.so
+session   required  pam_unix.so
+session   optional  pam_permit.so
+EOT
+    fi
+}
+
+function create_user() {
+    USER_NAME=$1
+    USER_PASSWORD=$2
+    if [ "$SYSTEMD_HOMED" == "true" ]; then
+        arch-chroot /mnt systemctl enable systemd-homed.service
+        create_user_homectl $USER_NAME $USER_PASSWORD
+#       create_user_useradd $USER_NAME $USER_PASSWORD
+    else
+        create_user_useradd $USER_NAME $USER_PASSWORD
+    fi
+}
+
+function create_user_homectl() {
+    USER_NAME=$1
+    USER_PASSWORD=$2
+    STORAGE=""
+    CIFS_DOMAIN=""
+    CIFS_USERNAME=""
+    CIFS_SERVICE=""
+    TZ=$(echo ${TIMEZONE} | sed "s/\/usr\/share\/zoneinfo\///g")
+    L=$(echo ${LOCALE_CONF[0]} | sed "s/LANG=//g")
+    IMAGE_PATH="/home/$USER_NAME.homedir"
+    HOME_PATH="/home/$USER_NAME"
+
+    if [ -n "$SYSTEMD_HOMED_STORAGE" ]; then
+        STORAGE="--storage=$SYSTEMD_HOMED_STORAGE"
+    fi
+    if [ "$SYSTEMD_HOMED_STORAGE" == "cifs" ]; then
+        CIFS_DOMAIN="--cifs-domain=$SYSTEMD_HOMED_CIFS_DOMAIN"
+        CIFS_USERNAME="--cifs-user-name=$USER_NAME"
+        CIFS_SERVICE="--cifs-service=$SYSTEMD_HOMED_CIFS_SERVICE"
+    fi
+    if [ "$SYSTEMD_HOMED_STORAGE" == "luks" ]; then
+        IMAGE_PATH="/home/$USER_NAME.home"
+    fi
+
+    ### something missing, inside alis this not works, after install the user is in state infixated
+    ### after install and reboot this commands work
+    systemctl start systemd-homed.service
+    set +e
+    homectl create "$USER_NAME" --enforce-password-policy=no --timezone=$TZ --language=$L $STORAGE $CIFS_DOMAIN $CIFS_USERNAME $CIFS_SERVICE -G wheel,storage,optical
+    homectl activate "$USER_NAME"
+    set -e
+    cp -a "$IMAGE_PATH/." "/mnt$IMAGE_PATH"
+    cp -a "$HOME_PATH/." "/mnt$HOME_PATH"
+    cp -a "/var/lib/systemd/home/." "/mnt/var/lib/systemd/home/"
+}
+
+function create_user_useradd() {
+    USER_NAME=$1
+    USER_PASSWORD=$2
+    arch-chroot /mnt useradd -m -G wheel,storage,optical -s /bin/bash $USER_NAME
+    printf "$USER_PASSWORD\n$USER_PASSWORD" | arch-chroot /mnt passwd $USER_NAME
+}
+
 function bootloader() {
     print_step "bootloader()"
 
@@ -707,7 +833,7 @@ function bootloader() {
     else
         CMDLINE_LINUX_ROOT="root=PARTUUID=$PARTUUID_ROOT"
     fi
-    if [ -n "$PARTITION_ROOT_ENCRYPTION_PASSWORD" ]; then
+    if [ -n "$LUKS_PASSWORD" ]; then
         if [ "$DEVICE_TRIM" == "true" ]; then
             BOOTLOADER_ALLOW_DISCARDS=":allow-discards"
         fi
@@ -730,20 +856,20 @@ function bootloader() {
 
     case "$BOOTLOADER" in
         "grub" )
-            grub
+            bootloader_grub
             ;;
         "refind" )
-            refind
+            bootloader_refind
             ;;
         "systemd" )
-            systemd
+            bootloader_systemd
             ;;
     esac
 
     arch-chroot /mnt systemctl set-default multi-user.target
 }
 
-function grub() {
+function bootloader_grub() {
     pacman_install "grub dosfstools"
     arch-chroot /mnt sed -i 's/GRUB_DEFAULT=0/GRUB_DEFAULT=saved/' /etc/default/grub
     arch-chroot /mnt sed -i 's/#GRUB_SAVEDEFAULT="true"/GRUB_SAVEDEFAULT="true"/' /etc/default/grub
@@ -769,14 +895,13 @@ function grub() {
     fi
 }
 
-function refind() {
+function bootloader_refind() {
     pacman_install "refind-efi"
     arch-chroot /mnt refind-install
 
     arch-chroot /mnt rm /boot/refind_linux.conf
     arch-chroot /mnt sed -i 's/^timeout.*/timeout 5/' "$ESP_DIRECTORY/EFI/refind/refind.conf"
     arch-chroot /mnt sed -i 's/^#scan_all_linux_kernels.*/scan_all_linux_kernels false/' "$ESP_DIRECTORY/EFI/refind/refind.conf"
-
     #arch-chroot /mnt sed -i 's/^#default_selection "+,bzImage,vmlinuz"/default_selection "+,bzImage,vmlinuz"/' "$ESP_DIRECTORY/EFI/refind/refind.conf"
 
     REFIND_MICROCODE=""
@@ -867,7 +992,7 @@ EOT
     fi
 }
 
-function systemd() {
+function bootloader_systemd() {
     arch-chroot /mnt systemd-machine-id-setup
     arch-chroot /mnt bootctl --path="$ESP_DIRECTORY" install
 
@@ -907,12 +1032,8 @@ EOT
         fi
     fi
 
-    if [ -n "$PARTITION_ROOT_ENCRYPTION_PASSWORD" ]; then
-       SYSTEMD_OPTIONS="rd.luks.options=discard"
-
-        cat <<EOT > "/mnt/etc/crypttab.initramfs"
-lvm $PARTITION_ROOT
-EOT
+    if [ -n "$LUKS_PASSWORD" ]; then
+       SYSTEMD_OPTIONS="luks.name=$UUID_ROOT=$LUKS_DEVICE_NAME luks.options=discard"
     fi
 
     echo "title Arch Linux" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux.conf"
@@ -1020,30 +1141,6 @@ EOT
     if [ "$VIRTUALBOX" == "true" ]; then
         echo -n "\EFI\systemd\systemd-bootx64.efi" > "/mnt$ESP_DIRECTORY/startup.nsh"
     fi
-}
-
-function users() {
-    print_step "users()"
-
-    create_user $USER_NAME $USER_PASSWORD
-
-    for U in ${ADDITIONAL_USERS[@]}; do
-        IFS='=' S=(${U})
-        USER=${S[0]}
-        PASSWORD=${S[1]}
-        create_user "${USER}" "${PASSWORD}"
-    done
-
-	arch-chroot /mnt sed -i 's/# %wheel ALL=(ALL) ALL/%wheel ALL=(ALL) ALL/' /etc/sudoers
-}
-
-function create_user() {
-    USER_NAME=$1
-    USER_PASSWORD=$2
-    arch-chroot /mnt useradd -m -G wheel,storage,optical -s /bin/bash $USER_NAME
-    printf "$USER_PASSWORD\n$USER_PASSWORD" | arch-chroot /mnt passwd $USER_NAME
-
-    pacman_install "xdg-user-dirs"
 }
 
 function desktop_environment() {
@@ -1215,6 +1312,20 @@ function packages_aur() {
     arch-chroot /mnt sed -i 's/%wheel ALL=(ALL) NOPASSWD: ALL/%wheel ALL=(ALL) ALL/' /etc/sudoers
 }
 
+function systemd_units() {
+    IFS=' ' UNITS=($SYSTEMD_UNITS)
+    for U in ${UNITS[@]}; do
+        UNIT=${U}
+        if [[ $UNIT == !* ]]; then
+            ACTION="disable"
+        else
+            ACTION="enable"
+        fi
+        UNIT=$(echo $UNIT | sed "s/!//g")
+        arch-chroot /mnt systemctl $ACTION $UNIT
+    done
+}
+
 function terminate() {
     cp "$CONF_FILE" "/mnt/etc/$CONF_FILE"
 
@@ -1276,65 +1387,141 @@ function end() {
 }
 
 function pacman_install() {
-    PACKAGES=$1
+    set +e
+    IFS=' ' PACKAGES=($1)
     for VARIABLE in {1..5}
     do
-        arch-chroot /mnt pacman -Syu --noconfirm --needed $PACKAGES
+        arch-chroot /mnt pacman -Syu --noconfirm --needed ${PACKAGES[@]}
         if [ $? == 0 ]; then
             break
         else
             sleep 10
         fi
     done
+    set -e
 }
 
 function aur_install() {
-    PACKAGES=$1
+    set +e
+    IFS=' ' PACKAGES=($1)
     for VARIABLE in {1..5}
     do
-        arch-chroot /mnt bash -c "echo -e \"$USER_PASSWORD\n$USER_PASSWORD\n$USER_PASSWORD\n$USER_PASSWORD\n\" | su $USER_NAME -c \"$AUR -Syu --noconfirm --needed $PACKAGES\""
+        arch-chroot /mnt bash -c "echo -e \"$USER_PASSWORD\n$USER_PASSWORD\n$USER_PASSWORD\n$USER_PASSWORD\n\" | su $USER_NAME -c \"$AUR -Syu --noconfirm --needed ${PACKAGES[@]}\""
         if [ $? == 0 ]; then
             break
         else
             sleep 10
         fi
     done
+    set -e
 }
 
 function print_step() {
-    STEP=$1
+    STEP="$1"
     echo ""
     echo -e "${LIGHT_BLUE}# ${STEP} step${NC}"
     echo ""
 }
 
-function main() {
-    configuration_install
-    sanitize_variables
-    check_variables
-    warning
-    init
-    facts
-    check_facts
-    prepare
-    partition
-    install
-    configuration
-    mkinitcpio_configuration
-    kernels
-    mkinitcpio
-    network
-    if [ "$VIRTUALBOX" == "true" ]; then
-        virtualbox
+function execute_step() {
+    STEP="$1"
+    STEPS="$2"
+    if [[ " $STEPS " =~ " $STEP " ]]; then
+        eval $STEP
+        save_globals
+    else
+        echo "Skipping $STEP"
     fi
-    users
-    bootloader
-    if [ "$DESKTOP_ENVIRONMENT" != "" ]; then
-        desktop_environment
-    fi
-    packages
-    terminate
-    end
 }
 
-main
+function load_globals() {
+    if [ -f "$GLOBALS_FILE" ]; then
+        source "$GLOBALS_FILE"
+    fi
+}
+
+function save_globals() {
+    cat <<EOT > $GLOBALS_FILE
+ASCIINEMA="$ASCIINEMA"
+BIOS_TYPE="$BIOS_TYPE"
+PARTITION_BOOT="$PARTITION_BOOT"
+PARTITION_ROOT="$PARTITION_ROOT"
+PARTITION_BOOT_NUMBER="$PARTITION_BOOT_NUMBER"
+PARTITION_ROOT_NUMBER="$PARTITION_ROOT_NUMBER"
+DEVICE_ROOT="$DEVICE_ROOT"
+DEVICE_LVM="$DEVICE_LVM"
+LUKS_DEVICE_NAME="$LUKS_DEVICE_NAME"
+LVM_VOLUME_GROUP="$LVM_VOLUME_GROUP"
+LVM_VOLUME_LOGICAL="$LVM_VOLUME_LOGICAL"
+SWAPFILE="$SWAPFILE"
+BOOT_DIRECTORY="$BOOT_DIRECTORY"
+ESP_DIRECTORY="$ESP_DIRECTORY"
+UUID_BOOT="$UUID_BOOT"
+UUID_ROOT="$UUID_ROOT"
+PARTUUID_BOOT="$PARTUUID_BOOT"
+PARTUUID_ROOT="$PARTUUID_ROOT"
+DEVICE_SATA="$DEVICE_SATA"
+DEVICE_NVME="$DEVICE_NVME"
+DEVICE_MMC="$DEVICE_MMC"
+CPU_VENDOR="$CPU_VENDOR"
+VIRTUALBOX="$VIRTUALBOX"
+CMDLINE_LINUX_ROOT="$CMDLINE_LINUX_ROOT"
+CMDLINE_LINUX="$CMDLINE_LINUX"
+EOT
+}
+
+function main() {
+    ALL_STEPS=("configuration_install" "sanitize_variables" "check_variables" "warning" "init" "facts" "check_facts" "prepare" "partition" "install" "configuration" "mkinitcpio_configuration" "kernels" "mkinitcpio" "network" "virtualbox" "users" "bootloader" "desktop_environment" "packages" "systemd_units" "terminate" "end")
+    STEP="configuration_install"
+
+    if [ -n "$1" ]; then
+        STEP="$1"
+    fi
+    if [ $STEP = "steps" ]; then
+        echo "Steps: $ALL_STEPS"
+        return 0
+    fi
+
+    # get step execute from
+    FOUND="false"
+    STEPS=""
+    for S in ${ALL_STEPS[@]}; do
+        if [ $FOUND = "true" -o "${STEP}" = "${S}" ]; then
+            FOUND="true"
+            STEPS="$STEPS $S"
+        fi
+    done
+
+    # execute steps
+    load_globals
+
+    execute_step "configuration_install" "${STEPS}"
+    execute_step "sanitize_variables" "${STEPS}"
+    execute_step "check_variables" "${STEPS}"
+    execute_step "warning" "${STEPS}"
+    execute_step "init" "${STEPS}"
+    execute_step "facts" "${STEPS}"
+    execute_step "check_facts" "${STEPS}"
+    execute_step "prepare" "${STEPS}"
+    execute_step "partition" "${STEPS}"
+    execute_step "install" "${STEPS}"
+    execute_step "configuration" "${STEPS}"
+    execute_step "mkinitcpio_configuration" "${STEPS}"
+    execute_step "kernels" "${STEPS}"
+    execute_step "mkinitcpio" "${STEPS}"
+    execute_step "network" "${STEPS}"
+    if [ "$VIRTUALBOX" == "true" ]; then
+        execute_step "virtualbox" "${STEPS}"
+    fi
+    execute_step "users" "${STEPS}"
+    execute_step "bootloader" "${STEPS}"
+    if [ -n "$DESKTOP_ENVIRONMENT" ]; then
+        execute_step "desktop_environment" "${STEPS}"
+    fi
+    execute_step "packages" "${STEPS}"
+    execute_step "systemd_units" "${STEPS}"
+    execute_step "terminate" "${STEPS}"
+    execute_step "end" "${STEPS}"
+}
+
+main $@
